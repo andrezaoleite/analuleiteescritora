@@ -1,33 +1,36 @@
 """Render do mockup de lançamento: a capa de "A Inventariante" na tela de um Kindle.
 
-A tela é dimensionada para que a capa apareça em resolução nativa (774 px de
-altura), sem upscale — por isso a tipografia continua nítida no arquivo final.
-As medidas do aparelho vêm do Kindle 11a geração (157,8 x 108,6 mm de corpo,
-tela de 6" com 90,7 x 122,6 mm de área ativa), convertidas para pixels.
+Medidas do aparelho seguem o Kindle 11a geração (corpo 157,8 x 108,6 mm, tela de
+6" com 90,7 x 122,6 mm de área ativa). Os bezels laterais são derivados por
+construção (BW = SW + 2*SIDE) para ficarem exatamente simétricos.
+
+A capa entra em "cover": preenche a área ativa e é cortada ~4% no topo e na base.
+O corte não alcança o bloco tipográfico, que começa a 14,5% da altura.
 
 Uso:
-    python3 kindle_inventariante.py capa.jpg saida.png
+    python3 kindle_inventariante.py capa.png saida.png
 """
 
 import math
-import random
 import sys
 
+import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 FONT = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
 
-# Geometria: mm -> px, ancorada na altura nativa da capa.
-S = 774 / 122.6
-SW, SH = round(90.7 * S), 774
-BW, BH = round(108.6 * S), round(157.8 * S)
-SIDE = (BW - SW) // 2
-TOP = round(9.0 * S)
-RAD = round(9.2 * S)
+SW, SH = 735, 994          # área ativa da tela
+SIDE, TOP, CHIN = 73, 73, 211
+BW, BH = SW + 2 * SIDE, TOP + SH + CHIN
+RAD = 75
+CANVAS = 1600
+BACK_SCALE = 0.94          # traseiro menor: dá profundidade
+BACK_DX, BACK_DY = -0.56, -0.085
+
+rng = np.random.default_rng(11)
 
 
 def rrect(w, h, r, ss=4, outline=False, width=2):
-    """Retângulo arredondado com antialiasing por supersampling."""
     m = Image.new("L", (w * ss, h * ss), 0)
     d = ImageDraw.Draw(m)
     if outline:
@@ -39,160 +42,160 @@ def rrect(w, h, r, ss=4, outline=False, width=2):
 
 
 def vgrad(w, h, c0, c1, gamma=1.0):
-    g = Image.new("RGB", (1, h))
-    for y in range(h):
-        t = (y / (h - 1)) ** gamma
-        g.putpixel((0, y), tuple(int(c0[i] + (c1[i] - c0[i]) * t) for i in range(3)))
-    return g.resize((w, h), Image.BICUBIC)
+    """Gradiente vertical com dither, para não posterizar nas áreas escuras."""
+    t = (np.linspace(0, 1, h) ** gamma)[:, None]
+    a = np.array(c0)[None, None, :] + (np.array(c1) - np.array(c0))[None, None, :] * t[:, :, None]
+    a = np.repeat(a, w, axis=1) + rng.uniform(-0.6, 0.6, (h, w, 3))
+    return Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
 
 
-def tracked(draw, cx, y, text, font, fill, tr):
-    """Texto centrado com entreletra, para a marca na moldura inferior."""
-    wid = sum(draw.textlength(c, font=font) for c in text) + tr * (len(text) - 1)
+def tracked(d, cx, y, text, font, fill, tr):
+    wid = sum(d.textlength(c, font=font) for c in text) + tr * (len(text) - 1)
     x = cx - wid / 2
     for c in text:
-        draw.text((x, y), c, font=font, fill=fill)
-        x += draw.textlength(c, font=font) + tr
+        d.text((x, y), c, font=font, fill=fill)
+        x += d.textlength(c, font=font) + tr
 
 
-def eink(cover):
-    """Aplica o comportamento da tela e-ink sobre a capa.
+def eink(cover_path):
+    """A capa como a tela e-ink a exibe.
 
-    A capa entra em "contain" (a proporção dela é mais estreita que a da tela),
-    então sobra a margem de papel do próprio e-ink nas laterais — que é o que um
-    Kindle real faz, sem cortar a arte.
+    A ordem importa: a frontlight e a vinheta entram ANTES do mapeamento de
+    faixa dinâmica, senão o realce estoura o teto do e-ink e aparece branco
+    puro — que papel eletrônico nenhum alcança. O grão entra depois do
+    redimensionamento e não há blur, para a tela não ficar mais macia que a arte.
     """
-    scr = Image.new("RGB", (SW, SH), (240, 238, 233))
-    scr.paste(cover, ((SW - cover.width) // 2, (SH - cover.height) // 2))
+    cov = Image.open(cover_path).convert("RGB")
+    k = SW / cov.width
+    cov = cov.resize((SW, round(cov.height * k)), Image.LANCZOS)
+    off = (cov.height - SH) // 2
+    cov = cov.crop((0, off, SW, off + SH))
 
-    scr = Image.blend(scr, scr.convert("L").convert("RGB"), 0.10)
-    # e-ink não alcança preto nem branco puros: comprime a faixa dinâmica.
-    scr = scr.point([int(24 + v * (241 - 24) / 255) for v in range(256)] * 3)
-    r, g, b = scr.split()
-    scr = Image.merge("RGB", (r.point(lambda v: min(255, int(v * 1.010))), g,
-                              b.point(lambda v: int(v * 0.978))))
+    a = np.asarray(cov).astype(np.float32)
+    a = a * 0.90 + a.mean(axis=2, keepdims=True) * 0.10
+    yy = np.linspace(0, 1, SH)[:, None, None]
+    xx = np.linspace(0, 1, SW)[None, :, None]
+    a = a + 14.0 * (yy ** 2.6)                                   # LEDs na base
+    rad = np.sqrt(((xx - 0.5) * 0.74) ** 2 + (yy - 0.5) ** 2) / 0.62
+    a = np.clip(a - 9.0 * np.clip(rad, 0, 1) ** 2.4, 0, 255)
+    a = 26.0 + a * (228.0 - 26.0) / 255.0                        # teto garantido
+    a = a * np.array([1.010, 1.0, 0.978])[None, None, :]         # papel morno
+    a = a + rng.normal(0, 2.2, a.shape)                          # grão de partícula
+    scr = Image.fromarray(np.clip(a, 0, 238).astype(np.uint8))
 
-    # Frontlight: LEDs na borda inferior, caindo suavemente para cima.
-    fl = Image.new("L", (SW, SH), 0)
-    fp = fl.load()
-    for y in range(SH):
-        base = int(15 * ((y / (SH - 1)) ** 2.6))
-        for x in range(SW):
-            fp[x, y] = base
-    fl = fl.filter(ImageFilter.GaussianBlur(24))
-    scr = ImageChops.add(scr, Image.merge("RGB", (fl, fl, fl)))
-
-    vg = Image.new("L", (SW, SH), 0)
-    vp = vg.load()
-    cx, cy = SW / 2, SH / 2
-    mx = math.hypot(cx, cy)
-    for y in range(SH):
-        for x in range(SW):
-            vp[x, y] = int(9 * (math.hypot(x - cx, y - cy) / mx) ** 2.4)
-    scr = ImageChops.subtract(scr, Image.merge("RGB", (vg, vg, vg)))
-
-    # Textura de partícula do e-ink + a difusão da superfície.
-    px = scr.load()
-    random.seed(7)
-    for y in range(SH):
-        for x in range(SW):
-            n = random.gauss(0, 1.3)
-            r0, g0, b0 = px[x, y]
-            px[x, y] = (max(0, min(255, int(r0 + n))),
-                        max(0, min(255, int(g0 + n))),
-                        max(0, min(255, int(b0 + n))))
-    scr = scr.filter(ImageFilter.GaussianBlur(0.35))
-
-    # Sombra que a moldura projeta sobre o vidro.
     sh = Image.new("L", (SW, SH), 0)
-    ImageDraw.Draw(sh).rectangle([0, 0, SW - 1, SH - 1], outline=255, width=7)
-    sh = sh.filter(ImageFilter.GaussianBlur(6))
-    scr = Image.composite(Image.new("RGB", (SW, SH), (14, 14, 16)), scr,
-                          sh.point(lambda v: int(v * 0.30)))
-
-    # Reflexo de vidro, bem discreto.
-    sn = Image.new("L", (SW, SH), 0)
-    ImageDraw.Draw(sn).polygon([(-40, 0), (SW * 0.50, 0), (-40, SH * 0.58)], fill=255)
-    sn = sn.filter(ImageFilter.GaussianBlur(80)).point(lambda v: int(v * 0.05))
-    return Image.composite(Image.new("RGB", (SW, SH), (255, 255, 255)), scr, sn)
+    ImageDraw.Draw(sh).rectangle([0, 0, SW - 1, SH - 1], outline=255, width=8)
+    return Image.composite(Image.new("RGB", (SW, SH), (12, 12, 14)), scr,
+                           sh.filter(ImageFilter.GaussianBlur(7)).point(lambda v: int(v * 0.34)))
 
 
-def rim(strength, lo=40):
-    m = rrect(BW, BH, RAD, outline=True, width=2).filter(ImageFilter.GaussianBlur(1.1))
-    m = ImageChops.multiply(m, vgrad(BW, BH, (255, 255, 255), (lo, lo, lo), 0.8).convert("L"))
-    return m.point(lambda v: int(v * strength))
+def edges(dev, lo_top, lo_bot):
+    """Aresta iluminada em volta e realce na base, para o corpo ter espessura."""
+    m = rrect(BW, BH, RAD, outline=True, width=3).filter(ImageFilter.GaussianBlur(1.3))
+    m = ImageChops.multiply(m, vgrad(BW, BH, (255, 255, 255), (lo_top,) * 3, 0.75).convert("L"))
+    dev.paste(Image.new("RGB", (BW, BH), (168, 168, 177)), (0, 0), m.point(lambda v: int(v * 0.60)))
+    b = Image.new("L", (BW, BH), 0)
+    ImageDraw.Draw(b).rounded_rectangle([6, BH - 14, BW - 7, BH - 3], radius=RAD // 2, fill=255)
+    dev.paste(Image.new("RGB", (BW, BH), (120, 120, 128)), (0, 0),
+              b.filter(ImageFilter.GaussianBlur(4)).point(lambda v: int(v * lo_bot)))
 
 
 def front(scr):
     dev = Image.new("RGBA", (BW, BH), (0, 0, 0, 0))
-    dev.paste(vgrad(BW, BH, (48, 48, 51), (20, 20, 23), 1.15), (0, 0), rrect(BW, BH, RAD))
+    dev.paste(vgrad(BW, BH, (50, 50, 53), (20, 20, 23), 1.15), (0, 0), rrect(BW, BH, RAD))
     dev.paste(scr, (SIDE, TOP))
-    dev.paste(Image.new("RGB", (BW, BH), (152, 152, 160)), (0, 0), rim(0.62))
+    edges(dev, 40, 0.42)
     d = ImageDraw.Draw(dev)
-    d.rectangle([SIDE - 1, TOP - 1, SIDE + SW, TOP + SH], outline=(9, 9, 11, 255), width=1)
-    tracked(d, BW / 2, TOP + SH + (BH - TOP - SH) / 2 - 24, "kindle",
-            ImageFont.truetype(FONT, 34), (116, 116, 122, 255), 3.4)
+    d.rectangle([SIDE - 1, TOP - 1, SIDE + SW, TOP + SH], outline=(8, 8, 10, 255), width=2)
+    tracked(d, BW / 2, TOP + SH + CHIN / 2 - 24, "kindle",
+            ImageFont.truetype(FONT, 44), (126, 126, 133, 255), 4.2)
     dev.putalpha(rrect(BW, BH, RAD))
     return dev
 
 
 def back():
     dev = Image.new("RGBA", (BW, BH), (0, 0, 0, 0))
-    dev.paste(vgrad(BW, BH, (40, 40, 43), (17, 17, 20), 1.25), (0, 0), rrect(BW, BH, RAD))
+    body = np.asarray(vgrad(BW, BH, (43, 43, 46), (18, 18, 21), 1.25)).astype(np.float32)
+    body += rng.normal(0, 1.5, body.shape)                       # acabamento fosco
+    dev.paste(Image.fromarray(np.clip(body, 0, 255).astype(np.uint8)), (0, 0), rrect(BW, BH, RAD))
 
-    # Arco do chanfro da carcaça traseira.
     ss = 3
-    a = Image.new("L", (BW * ss, BH * ss), 0)
-    ImageDraw.Draw(a).arc([int(BW * 0.05 * ss), int(BH * 0.02 * ss),
-                           int(BW * 1.28 * ss), int(BH * 0.40 * ss)],
-                          start=8, end=104, fill=255, width=int(9 * ss))
-    a = a.resize((BW, BH), Image.LANCZOS).filter(ImageFilter.GaussianBlur(7))
-    dev.paste(Image.new("RGB", (BW, BH), (140, 140, 148)), (0, 0), a.point(lambda v: int(v * 0.42)))
+    arc = Image.new("L", (BW * ss, BH * ss), 0)
+    ImageDraw.Draw(arc).arc([int(BW * 0.05 * ss), int(BH * 0.02 * ss),
+                             int(BW * 1.28 * ss), int(BH * 0.40 * ss)],
+                            start=8, end=104, fill=255, width=int(9 * ss))
+    dev.paste(Image.new("RGB", (BW, BH), (132, 132, 140)), (0, 0),
+              arc.resize((BW, BH), Image.LANCZOS)
+                 .filter(ImageFilter.GaussianBlur(8)).point(lambda v: int(v * 0.38)))
 
-    dg = Image.new("L", (BW, BH), 0)
-    ImageDraw.Draw(dg).polygon([(0, 0), (BW * 0.85, 0), (0, BH * 0.75)], fill=255)
-    dg = dg.filter(ImageFilter.GaussianBlur(110)).point(lambda v: int(v * 0.10))
-    dev.paste(Image.new("RGB", (BW, BH), (190, 190, 200)), (0, 0), dg)
+    # Logo deslocado para 40% da largura: centralizado ele ficaria escondido
+    # atrás do aparelho da frente.
+    lw = BW * 0.34
+    lx, ly = BW * 0.40, BH * 0.52
+    lg = Image.new("L", (BW * ss, BH * ss), 0)
+    dl = ImageDraw.Draw(lg)
+    dl.arc([int((lx - lw / 2) * ss), int((ly - lw * 0.40) * ss),
+            int((lx + lw / 2) * ss), int((ly + lw * 0.40) * ss)],
+           start=16, end=152, fill=255, width=int(8 * ss))
+    tx = lx + lw / 2 * math.cos(math.radians(16))
+    ty = ly + lw * 0.40 * math.sin(math.radians(16))
+    dl.polygon([((tx + 20) * ss, (ty - 18) * ss), ((tx - 10) * ss, (ty + 3) * ss),
+                ((tx + 7) * ss, (ty + 19) * ss)], fill=255)
+    dev.paste(Image.new("RGB", (BW, BH), (78, 78, 84)), (0, 0),
+              lg.resize((BW, BH), Image.LANCZOS).filter(ImageFilter.GaussianBlur(1.3)))
 
-    dev.paste(Image.new("RGB", (BW, BH), (132, 132, 140)), (0, 0), rim(0.50, lo=30))
+    edges(dev, 30, 0.30)
     dev.putalpha(rrect(BW, BH, RAD))
     return dev
 
 
-def compose(cover_path, out_path, size=1280):
-    cover = Image.open(cover_path).convert("RGB")
-    scr = eink(cover)
+def compose(cover_path, out_path):
+    scr = eink(cover_path)
+    canvas = np.full((CANVAS, CANVAS, 3), 255.0, dtype=np.float32)
 
-    canvas = Image.new("RGB", (size, size), (255, 255, 255))
-    fx, fy = 0, 0
-    bx, by = -int(BW * 0.50), -int(BH * 0.10)
-    minx, miny = min(fx, bx), min(fy, by)
-    maxx, maxy = max(fx, bx) + BW, max(fy, by) + BH
-    ox = (size - (maxx - minx)) // 2 - minx
-    oy = (size - (maxy - miny)) // 2 - miny
-    FX, FY, BX, BY = fx + ox, fy + oy, bx + ox, by + oy
+    bw2, bh2 = round(BW * BACK_SCALE), round(BH * BACK_SCALE)
+    bx, by = round(BW * BACK_DX), round(BH * BACK_DY)
+    minx, miny = min(0, bx), min(0, by)
+    maxx, maxy = max(BW, bx + bw2), max(BH, by + bh2)
+    ox = (CANVAS - (maxx - minx)) // 2 - minx
+    oy = (CANVAS - (maxy - miny)) // 2 - miny
+    FX, FY, BX, BY = ox, oy, bx + ox, by + oy
 
-    def shadow(pos, blur, dy, op):
-        lay = Image.new("L", (size, size), 0)
-        lay.paste(rrect(BW, BH, RAD), (pos[0], pos[1] + dy))
-        lay = lay.filter(ImageFilter.GaussianBlur(blur)).point(lambda v: int(v * op))
-        canvas.paste(Image.new("RGB", (size, size), (122, 120, 122)), (0, 0), lay)
+    def shade(pos, size, blur, dy, strength):
+        """Sombra multiplicativa.
 
-    shadow((BX, BY), 34, 26, 0.28)
-    bk = back()
-    canvas.paste(bk, (BX, BY), bk)
-    # O aparelho da frente projeta sombra sobre o de trás.
-    shadow((FX, FY), 30, 22, 0.32)
-    shadow((FX, FY), 11, 6, 0.20)
-    fr = front(scr)
-    canvas.paste(fr, (FX, FY), fr)
+        Colar cinza por cima parecia sombra sobre o fundo branco, mas CLAREAVA o
+        aparelho escuro de trás. Multiplicar escurece os dois corretamente.
+        """
+        nonlocal canvas
+        lay = Image.new("L", (CANVAS, CANVAS), 0)
+        lay.paste(rrect(size[0], size[1], round(RAD * size[0] / BW)), (pos[0], pos[1] + dy))
+        m = np.asarray(lay.filter(ImageFilter.GaussianBlur(blur))).astype(np.float32) / 255.0
+        canvas *= (1.0 - strength * m)[:, :, None]
 
-    canvas.save(out_path)
-    return canvas
+    def put(img, pos):
+        nonlocal canvas
+        arr = np.asarray(img).astype(np.float32)
+        al = arr[:, :, 3:4] / 255.0
+        x, y = pos
+        h, w = arr.shape[:2]
+        canvas[y:y + h, x:x + w, :] = canvas[y:y + h, x:x + w, :] * (1 - al) + arr[:, :, :3] * al
+
+    bk = back().resize((bw2, bh2), Image.LANCZOS).filter(ImageFilter.GaussianBlur(1.1))
+    shade((BX, BY), (bw2, bh2), 38, 30, 0.34)
+    shade((BX, BY), (bw2, bh2), 13, 7, 0.22)       # contato
+    put(bk, (BX, BY))
+    shade((FX, FY), (BW, BH), 34, 26, 0.38)        # cai também sobre o traseiro
+    shade((FX, FY), (BW, BH), 12, 7, 0.26)
+    put(front(scr), (FX, FY))
+
+    out = Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8))
+    out.save(out_path)
+    return out
 
 
 if __name__ == "__main__":
-    src = sys.argv[1] if len(sys.argv) > 1 else "capa.jpg"
+    src = sys.argv[1] if len(sys.argv) > 1 else "capa.png"
     dst = sys.argv[2] if len(sys.argv) > 2 else "a-inventariante-kindle.png"
     compose(src, dst)
     print("gravado:", dst)
